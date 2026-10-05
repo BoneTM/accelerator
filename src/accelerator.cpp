@@ -11,13 +11,15 @@
 #include <sys/stat.h>
 
 #include <array>
-#include <ctime>
+#include <chrono>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+#include <system_error>
 #include <fmt/base.h>
-#include <fmt/chrono.h>
 #include <fmt/core.h>
 #include <thread>
-
-#include <sys/stat.h>
 
 #include "google_breakpad/processor/basic_source_line_resolver.h"
 #include "google_breakpad/processor/minidump_processor.h"
@@ -31,7 +33,9 @@
 
 static constexpr std::array<int, 5> kExceptionSignals = { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS };
 void (*SignalHandler)(int, siginfo_t*, void*);
-constexpr std::string_view dumpPath                 = "./breakpad";
+// 使用游戏可执行文件旁的目录，与 parasite 的 CS2 崩溃包收集路径保持一致。
+// 在初始化时固定绝对路径，避免启动目录或游戏后续 chdir 影响输出位置。
+static std::string dumpPath;
 google_breakpad::ExceptionHandler* exceptionHandler = nullptr;
 
 bool g_should_stop = false;
@@ -41,7 +45,7 @@ static void kill_myself()
     kill(getpid(), SIGKILL);
 }
 
-static bool ProcessMinidump(const char* minidump_path, const std::string& output_base_path)
+static bool ProcessMinidump(const char* minidump_path)
 {
     std::unique_ptr<google_breakpad::SimpleSymbolSupplier> symbol_supplier;
     google_breakpad::BasicSourceLineResolver resolver;
@@ -58,98 +62,31 @@ static bool ProcessMinidump(const char* minidump_path, const std::string& output
     if (minidump_processor.Process(&mini_dump, &process_state) != google_breakpad::PROCESS_OK)
         return false;
 
-    std::string info_path = output_base_path + ".txt";
+    // 与离线 minidump_processor 保持一致：UUID.dmp 与 UUID.dmp.txt 一一对应。
+    std::string info_path = std::string(minidump_path) + ".txt";
     FILE* info_file       = fopen(info_path.c_str(), "w");
-    if (info_file)
-    {
-        FILE* old_stdout = stdout;
-        stdout           = info_file;
-        PrintProcessState(process_state, true, false, &resolver);
-        fflush(stdout);
-        stdout = old_stdout;
-        fclose(info_file);
-    }
+    if (!info_file)
+        return false;
 
-    try
-    {
-        std::filesystem::remove(minidump_path);
-    }
-    catch (...)
-    {
-    }
+    FILE* old_stdout = stdout;
+    stdout           = info_file;
+    PrintProcessState(process_state, true, false, &resolver);
+    const bool flushed = fflush(info_file) == 0;
+    const bool written = ferror(info_file) == 0;
+    stdout             = old_stdout;
+    const bool closed  = fclose(info_file) == 0;
 
-    return true;
-}
-
-static void CleanupOldFiles()
-{
-    if (!std::filesystem::exists(dumpPath) || !std::filesystem::is_directory(dumpPath))
-        return;
-
-    for (const auto& entry : std::filesystem::directory_iterator(dumpPath))
-    {
-        if (!entry.is_regular_file())
-            continue;
-
-        auto ext = entry.path().extension();
-        if (ext != ".txt" && ext != ".dmp")
-            continue;
-
-        try
-        {
-            auto file_time     = std::filesystem::last_write_time(entry);
-            auto file_age      = std::filesystem::file_time_type::clock::now() - file_time;
-            auto file_age_days = std::chrono::duration_cast<std::chrono::hours>(file_age).count() / 24;
-
-            if (file_age_days >= 30)
-            {
-                std::filesystem::remove(entry.path());
-            }
-        }
-        catch (...)
-        {
-        }
-    }
-}
-
-static void ProcessExistingMinidumps()
-{
-    if (!std::filesystem::exists(dumpPath) || !std::filesystem::is_directory(dumpPath))
-        return;
-
-    for (const auto& entry : std::filesystem::directory_iterator(dumpPath))
-    {
-        if (!entry.is_regular_file() || entry.path().extension() != ".dmp")
-            continue;
-
-        std::string output_base_path = fmt::format("./breakpad/{}", entry.path().stem().string());
-        ProcessMinidump(entry.path().string().c_str(), output_base_path);
-    }
+    // dmp 是原始现场，无论文本解析是否成功都保留，由 parasite 归档、补传并清理。
+    return flushed && written && closed;
 }
 
 static bool DumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, void* context, bool succeeded)
 {
     g_should_stop = true;
 
-    try
-    {
-        std::filesystem::create_directories("./breakpad");
-    }
-    catch (const std::exception& e)
-    {
-        FILE* error_log = fopen("./breakpad_error.log", "a");
-        if (error_log)
-        {
-            fprintf(error_log, "Failed to create breakpad directory: %s\n", e.what());
-            fclose(error_log);
-        }
-        kill_myself();
-        return false;
-    }
-
     if (!succeeded)
     {
-        FILE* error_log = fopen("./breakpad/crash_error.log", "a");
+        FILE* error_log = fopen((dumpPath + "/crash_error.log").c_str(), "a");
         if (error_log)
         {
             fprintf(error_log, "Failed to write minidump\n");
@@ -159,37 +96,32 @@ static bool DumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
         return false;
     }
 
-    auto t         = std::time(nullptr);
-    auto timestamp = fmt::format("{:%Y-%m-%d-%H-%M-%S}", fmt::localtime(t));
-    auto base_path = fmt::format("./breakpad/crashdump_{}", timestamp);
-
-    bool result = ProcessMinidump(descriptor.path(), base_path);
-    if (!result)
-    {
-        kill_myself();
-    }
-
-    return result;
+    // 文本只是辅助产物，失败时仍保留已生成的 dmp，并向 Breakpad 返回转储成功。
+    // 不因为文本失败发送 SIGKILL，否则 parasite 可能把真实崩溃误判为 OOM。
+    ProcessMinidump(descriptor.path());
+    return succeeded;
 }
 
 extern "C" __attribute__((visibility("default"))) bool InitBreakpad()
 {
-    struct stat st = { 0 };
-    if (stat(dumpPath.data(), &st) == -1)
+    std::error_code error;
+    const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (error)
     {
-        if (mkdir(dumpPath.data(), 0770) == -1)
-        {
-            fmt::println("[Breakpad] Failed to create file path: {}", dumpPath.data());
-            return false;
-        }
+        fmt::println("[Breakpad] Failed to locate game executable: {}", error.message());
+        return false;
     }
-    else
+    dumpPath = (executable.parent_path() / "breakpad").string();
+    std::filesystem::create_directories(dumpPath, error);
+    if (error)
     {
-        chmod(dumpPath.data(), 0770);
+        fmt::println("[Breakpad] Failed to create file path: {}: {}", dumpPath, error.message());
+        return false;
     }
+    chmod(dumpPath.c_str(), 0770);
 
-    CleanupOldFiles();
-    ProcessExistingMinidumps();
+    // 不在新运行里重写历史报告或按文件年龄删除现场：parasite 依靠启动基线和
+    // mtime 判断 runId，且尚未上传成功的文件必须保留供后续重试。
 
     google_breakpad::MinidumpDescriptor descriptor(dumpPath.data());
     exceptionHandler = new google_breakpad::ExceptionHandler(descriptor, nullptr, DumpCallback, nullptr, true, -1);
